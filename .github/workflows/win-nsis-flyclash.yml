@@ -1,0 +1,123 @@
+name: Win NSIS + FlyInWind mihomo
+
+on:
+  push:
+    branches: ["pkg/**"]
+    paths: [".github/workflows/win-nsis-flyclash.yml"]
+  workflow_dispatch:
+    inputs:
+      mihomo_ref:
+        description: "FlyInWind1/mihomo branch or tag"
+        default: "v0.9.2-local"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Disable updater artifacts
+        shell: pwsh
+        run: |
+          $j = Get-Content src-tauri/tauri.conf.json -Raw | jq '.bundle.externalBin = ["sidecar/verge-mihomo"] | .bundle.createUpdaterArtifacts = false'
+          Set-Content -Path src-tauri/tauri.conf.json -Value $j -NoNewline
+
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          run_install: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.21.0"
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          targets: x86_64-pc-windows-msvc
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-flyclash2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-flyclash2-
+
+      - name: Build custom mihomo (FlyInWind fork)
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+      - shell: bash
+        run: |
+          {
+            set -x
+            git version
+            git clone --depth 1 --branch "${{ github.event.inputs.mihomo_ref || 'v0.9.2-local' }}" https://github.com/FlyInWind1/mihomo.git core-fly
+            cd core-fly
+            sha=$(git rev-parse --short HEAD)
+            ver="1.19.33-flyclash-$sha"
+            GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -tags with_gvisor -trimpath -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=$ver' -X 'github.com/metacubex/mihomo/constant.BuildTime=2026-10-26T00:00:00Z' -w -s -buildid=" -o ../mihomo-custom.exe .
+            cd ..
+            ./mihomo-custom.exe -v
+            mkdir -p src-tauri/sidecar
+            cp -f mihomo-custom.exe src-tauri/sidecar/verge-mihomo-x86_64-pc-windows-msvc.exe
+          } > transcript.log 2>&1 || { tail -50 transcript.log; exit 1; }
+
+      - name: pnpm install
+        run: pnpm i
+
+      - name: Prepare platform resources
+        run: pnpm run prebuild x86_64-pc-windows-msvc
+
+      - name: Overwrite sidecar with custom core after prebuild
+        shell: pwsh
+        run: |
+          # prebuild downloads upstream mihomo; restore the custom binary afterwards
+          Copy-Item mihomo-custom.exe src-tauri/sidecar/verge-mihomo-x86_64-pc-windows-msvc.exe -Force
+
+      - name: Tauri build (NSIS)
+        env:
+          NODE_OPTIONS: "--max_old_space_size=4096"
+        run: pnpm tauri build --target x86_64-pc-windows-msvc -b nsis
+
+      - name: Upload step transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-transcript
+          path: transcript.log
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          $exes = Get-ChildItem -Path target -Recurse -Filter *.exe -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 1MB } |
+            Sort-Object Length -Descending
+          $exes | Select-Object FullName, @{n='MB';e={[math]::Round($_.Length/1MB,1)}} | Format-Table -AutoSize | Out-String | Out-File exe-report.txt
+          $setup = $exes | Where-Object { $_.FullName -match 'nsis' -and $_.Name -match 'setup' } | Select-Object -First 1
+          if (-not $setup) { Write-Host "no nsis setup exe found"; Get-Content exe-report.txt; exit 1 }
+          Write-Host "installer: $($setup.FullName)"
+          Copy-Item $setup.FullName clash-verge-flyclash-win-x64-setup.exe -Force
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: clash-verge-flyclash-win-x64
+          path: clash-verge-flyclash-win-x64-setup.exe
+
+      - name: Upload exe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exe-report
+          path: exe-report.txt
